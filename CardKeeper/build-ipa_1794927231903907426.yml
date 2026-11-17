@@ -1,0 +1,143 @@
+name: Build IPA
+
+# 手动触发，或推送到 main/master 时自动构建
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 注意：macos-14 已于 2026-11-02 从 GitHub Actions 下线，必须用 macos-15 及以上
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- 1. 选定 Xcode ----------
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          for v in Xcode_16.4.app Xcode_16.3.app Xcode_16.2.app Xcode_16.1.app; do
+            if [ -d "/Applications/$v" ]; then
+              sudo xcode-select -s "/Applications/$v"
+              echo "✅ 使用 $v"
+              break
+            fi
+          done
+          xcodebuild -version
+          echo "--- 可用 iOS SDK ---"
+          xcodebuild -showsdks 2>/dev/null | grep -i iphoneos || true
+
+      # ---------- 2. 定位工程（自动兼容多套了一层文件夹） ----------
+      - name: Locate project
+        id: proj
+        run: |
+          set -euo pipefail
+          PROJ="$(find . -maxdepth 4 -type d -name 'CardKeeper.xcodeproj' | head -n 1)"
+          if [ -z "$PROJ" ]; then
+            echo "::error::仓库里找不到 CardKeeper.xcodeproj，请确认上传的是解压后的完整工程"
+            echo "--- 当前仓库目录结构 ---"
+            find . -maxdepth 3 -not -path './.git/*' -print
+            exit 1
+          fi
+          DIR="$(cd "$(dirname "$PROJ")" && pwd)"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "✅ 工程目录：$DIR"
+          echo "--- 目录内容 ---"
+          ls -1 "$DIR"
+
+      # ---------- 3. 预检工程是否可被 Xcode 读取 ----------
+      - name: Sanity check project
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          xcodebuild -list -project CardKeeper.xcodeproj
+
+      # ---------- 4. 编译（未签名、arm64） ----------
+      - name: Build (Release, arm64, unsigned)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project CardKeeper.xcodeproj \
+            -scheme CardKeeper \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # ---------- 5. 失败时把真正的报错摘出来 ----------
+      - name: Print errors
+        if: failure()
+        run: |
+          echo "================ 编译错误 ================"
+          grep -n "error:" "$RUNNER_TEMP/build.log" | head -n 60 || echo "（日志中没有 error: 关键字）"
+          echo "================ 日志末尾 120 行 ================"
+          tail -n 120 "$RUNNER_TEMP/build.log" || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
+
+      # ---------- 6. 校验产物 ----------
+      - name: Verify app bundle
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/CardKeeper.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::没有生成 $APP"
+            find "$RUNNER_TEMP/dd/Build/Products" -maxdepth 3 -print || true
+            exit 1
+          fi
+          ls -la "$APP"
+          file "$APP/CardKeeper"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist"
+
+      # ---------- 7. 打包 IPA ----------
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/CardKeeper.app"
+          rm -rf "$RUNNER_TEMP/Payload"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          rm -f CardKeeper-unsigned.ipa
+          zip -qry CardKeeper-unsigned.ipa Payload
+          ls -lh CardKeeper-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CardKeeper-unsigned-ipa
+          path: ${{ runner.temp }}/CardKeeper-unsigned.ipa
+          if-no-files-found: error
+
+      # 发布到 Releases：手机浏览器可直接点链接下载，无需登录
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: 卡管家 最新构建
+          body: |
+            未签名 IPA（arm64，最低 iOS 15.0），用于 TrollStore 或 Sideloadly 安装。
+            下载后如得到 zip，请先在「文件」App 中长按解压，再分享给 TrollStore。
+          files: ${{ runner.temp }}/CardKeeper-unsigned.ipa
+          prerelease: true
